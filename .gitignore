@@ -1,38 +1,6 @@
-# OS
-.DS_Store
-Thumbs.db
-
-# Editors
-.idea/
-.vscode/
-*.swp
-*.swo
-
-# Backend (FastAPI / Python)
-__pycache__/
-*.py[cod]
-*.egg-info/
 .venv/
-venv/
 .pytest_cache/
-.coverage
-htmlcov/
-*.db
-*.db-journal
-
-# Frontend (React / Vite)
-node_modules/
-dist/
-.vite/
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
-pnpm-debug.log*
-
-# Env files (both backend and frontend can have local overrides)
+__pycache__/
+*.pyc
+data/
 .env
-.env.*
-!.env.example
-
-*.pem
-*.csv
