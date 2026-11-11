@@ -1,13 +1,25 @@
 import os
 import sqlite3
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from uuid import uuid4
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse
+from opentelemetry import trace
+from opentelemetry.trace import SpanKind, StatusCode
 from pydantic import BaseModel, Field
+from starlette.routing import Match
+
+from app.telemetry import (
+    logger,
+    order_lookup_duration,
+    order_lookup_requests,
+    setup_telemetry,
+    tracer,
+)
 
 
 DB_PATH = Path(os.getenv("ORDER_DB_PATH", "data/orders.db"))
@@ -72,11 +84,67 @@ class StatusUpdate(BaseModel):
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    setup_telemetry()
     init_db()
     yield
 
 
 app = FastAPI(title="Order Tracker", lifespan=lifespan)
+
+ORDER_LOOKUP_ROUTE = "/api/orders/{order_id}"
+
+
+def is_order_lookup(scope) -> bool:
+    for route in app.router.routes:
+        if getattr(route, "path", None) == ORDER_LOOKUP_ROUTE:
+            match, _ = route.matches(scope)
+            if match == Match.FULL:
+                return True
+    return False
+
+
+@app.middleware("http")
+async def order_lookup_telemetry(request: Request, call_next):
+    """Emit a server span plus request count/duration metrics for order lookups.
+
+    Runs outside FastAPI's exception handling, so it sees the final status code:
+    404 from HTTPException, and 500 for unhandled errors (which are re-raised).
+    """
+    if not is_order_lookup(request.scope):
+        return await call_next(request)
+
+    method = request.method
+    status_code = 500
+    error_type = None
+    start = time.perf_counter()
+    with tracer.start_as_current_span(
+        f"{method} {ORDER_LOOKUP_ROUTE}",
+        kind=SpanKind.SERVER,
+        attributes={
+            "http.request.method": method,
+            "http.route": ORDER_LOOKUP_ROUTE,
+            "url.path": request.url.path,
+        },
+    ) as span:
+        try:
+            response = await call_next(request)
+            status_code = response.status_code
+            return response
+        except Exception as exc:
+            error_type = type(exc).__qualname__
+            raise
+        finally:
+            attributes = {
+                "http.request.method": method,
+                "http.route": ORDER_LOOKUP_ROUTE,
+                "http.response.status_code": status_code,
+            }
+            if status_code >= 500:
+                attributes["error.type"] = error_type or str(status_code)
+                span.set_status(StatusCode.ERROR)
+            span.set_attributes(attributes)
+            order_lookup_requests.add(1, attributes)
+            order_lookup_duration.record(time.perf_counter() - start, attributes)
 
 
 @app.get("/")
@@ -98,13 +166,48 @@ def list_orders():
     return [as_dict(row) for row in rows]
 
 
-@app.get("/api/orders/{order_id}")
-def get_order(order_id: str):
+def fetch_order_row(order_id: str):
     with connect() as db:
-        row = db.execute("SELECT * FROM orders WHERE id = ?", (order_id,)).fetchone()
+        return db.execute("SELECT * FROM orders WHERE id = ?", (order_id,)).fetchone()
+
+
+def load_order(order_id: str):
+    row = fetch_order_row(order_id)
     if row is None:
         raise HTTPException(404, "Order not found")
     return order_detail(row)
+
+
+@app.get(ORDER_LOOKUP_ROUTE)
+def get_order(order_id: str):
+    trace.get_current_span().set_attribute("order.id", order_id)
+    with tracer.start_as_current_span(
+        "SELECT orders",
+        kind=SpanKind.CLIENT,
+        attributes={
+            "db.system.name": "sqlite",
+            "db.operation.name": "SELECT",
+            "db.collection.name": "orders",
+        },
+    ):
+        row = fetch_order_row(order_id)
+    if row is None:
+        logger.warning("Order not found", extra={"order.id": order_id})
+        raise HTTPException(404, "Order not found")
+    try:
+        order = order_detail(row)
+    except Exception:
+        logger.exception(
+            "Failed to build order details",
+            extra={"order.id": order_id, "order.priority": row["priority"]},
+        )
+        raise
+    logger.info(
+        "Order lookup succeeded",
+        extra={"order.id": order_id, "order.priority": order["priority"],
+               "order.status": order["status"]},
+    )
+    return order
 
 
 @app.post("/api/orders", status_code=201)
@@ -118,7 +221,7 @@ def create_order(order: NewOrder):
             (order_id, order.customer, order.item, order.priority, "received",
              datetime.now(timezone.utc).isoformat()),
         )
-    return get_order(order_id)
+    return load_order(order_id)
 
 
 @app.patch("/api/orders/{order_id}")
@@ -132,4 +235,4 @@ def update_status(order_id: str, update: StatusUpdate):
         )
     if cursor.rowcount == 0:
         raise HTTPException(404, "Order not found")
-    return get_order(order_id)
+    return load_order(order_id)

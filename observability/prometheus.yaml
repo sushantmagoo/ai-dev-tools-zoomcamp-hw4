@@ -1,0 +1,22 @@
+# Metrics arrive via OTLP push from the Collector, so there are no app scrape jobs.
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+otlp:
+  # Copy useful resource attributes onto every series (service.name becomes job).
+  promote_resource_attributes:
+    - service.name
+    - service.namespace
+    - service.instance.id
+    - deployment.environment
+
+storage:
+  tsdb:
+    # OTLP pushes can arrive slightly out of order.
+    out_of_order_time_window: 30m
+
+scrape_configs:
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]

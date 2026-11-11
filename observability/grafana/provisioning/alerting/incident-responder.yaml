@@ -1,0 +1,22 @@
+# Send all Grafana alerts to the incident responder (incident-response/), which
+# runs on the host at port 8001. Grafana reaches the host via host.docker.internal.
+apiVersion: 1
+
+contactPoints:
+  - orgId: 1
+    name: incident-responder
+    receivers:
+      - uid: incident-responder-webhook
+        type: webhook
+        settings:
+          url: http://host.docker.internal:8001/alerts
+          httpMethod: POST
+        disableResolveMessage: false
+
+policies:
+  - orgId: 1
+    receiver: incident-responder
+    group_by: ["grafana_folder", "alertname", "http_route"]
+    group_wait: 10s
+    group_interval: 1m
+    repeat_interval: 4h

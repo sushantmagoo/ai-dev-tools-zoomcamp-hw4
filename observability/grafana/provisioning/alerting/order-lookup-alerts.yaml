@@ -1,0 +1,75 @@
+# Grafana-managed alert rules, provisioned at startup.
+# Alert provisioning files are not env-expanded, so dashboard_url uses the
+# default Grafana port; update it if you change GRAFANA_PORT.
+apiVersion: 1
+
+groups:
+  - orgId: 1
+    name: order-lookups
+    folder: Order Tracker
+    interval: 30s
+    rules:
+      - uid: order-lookup-5xx
+        title: Order lookup 5xx responses
+        condition: C
+        data:
+          # A: 5xx lookups per route over the last 5 minutes. The "or ... * 0"
+          # branch returns 0 for every route that had traffic but no 5xx, so the
+          # rule evaluates to Normal with a real value instead of "No data".
+          - refId: A
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: prometheus
+            model:
+              refId: A
+              datasource:
+                type: prometheus
+                uid: prometheus
+              editorMode: code
+              expr: >-
+                sum by (http_route) (increase(order_lookup_requests_total{job="order-tracker", http_response_status_code=~"5.."}[5m]))
+                or
+                sum by (http_route) (increase(order_lookup_requests_total{job="order-tracker"}[5m])) * 0
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+          - refId: B
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: reduce
+              expression: A
+              reducer: last
+              settings:
+                mode: dropNN
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator:
+                    type: gt
+                    params: [0]
+        # No lookups at all in the window (e.g. idle service) is not an error.
+        noDataState: OK
+        execErrState: Error
+        for: 1m
+        labels:
+          severity: critical
+          service: order-tracker
+        annotations:
+          summary: "5xx responses on GET {{ $labels.http_route }}"
+          description: >-
+            {{ printf "%.0f" $values.B.Value }} order lookup request(s) to
+            GET {{ $labels.http_route }} returned a 5xx status in the last 5 minutes.
+          endpoint: "GET {{ $labels.http_route }}"
+          time_window: 5m
+          dashboard_url: "http://127.0.0.1:3000/d/order-tracker-lookups/order-tracker-order-lookups?orgId=1&from=now-1h&to=now"
+          # Links the rule to the dashboard panel (shows state on the panel and
+          # sets DashboardURL/PanelURL in notifications).
+          __dashboardUid__: order-tracker-lookups
+          __panelId__: "7"
